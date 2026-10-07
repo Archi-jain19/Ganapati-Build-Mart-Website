@@ -2,7 +2,7 @@
 
 # 🏗 Ganapati Build Mart - Official Company Website  
 
-### 🌐 Hosted at: [www.gbmart.in](http://www.gbmart.in)  
+### 🌐 Hosted at: [[www.gbmart.in](http://www.gbmart.in) ](https://ganapati-build-mart-website-git-main-archi-jain19s-projects.vercel.app/) 
 
 ---
 

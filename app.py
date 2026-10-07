@@ -1,22 +1,25 @@
+import os
 from flask import Flask, render_template, request, redirect, url_for, session, jsonify, flash
 import mysql.connector
 from flask_cors import CORS  # Import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
+import db
 
-app = Flask(__name__)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-application=app
-# Database connection details
-db_config = {
-    'host': '148.113.4.193',
-    'user': 'gbmartin_root',
-    'password': 'aakash@1609',  # Replace with your password
-    'database': 'gbmartin_product_db'
-}
+app = Flask(
+    __name__,
+    template_folder=os.path.join(BASE_DIR, 'templates'),
+    static_folder=os.path.join(BASE_DIR, 'static')
+)
+application = app
+
+# Database connection details (maintained for compatibility)
+db_config = db.MYSQL_CONFIG
 
 CORS(app)
 # Secret key for session management
-app.secret_key = 'your_secret_key'
+app.secret_key = os.environ.get('SECRET_KEY', 'ganapati-build-mart-production-secret-2025')
 
 # Number of products to display per page
 PRODUCTS_PER_PAGE = 12
@@ -24,9 +27,8 @@ PRODUCTS_PER_PAGE = 12
 
 # Route for the home page
 @app.route('/')
-
 def home():
-    conn = mysql.connector.connect(**db_config)
+    conn = db.get_connection()
     cursor = conn.cursor(dictionary=True)
 
     cursor.execute("SELECT name, url FROM brands")
@@ -41,8 +43,30 @@ def home():
 def about():
     return render_template('About.html')
 
-@app.route('/contact')
+@app.route('/contact', methods=['GET', 'POST'])
 def contact():
+    if request.method == 'POST':
+        name = request.form.get('name', '').strip()
+        email = request.form.get('email', '').strip()
+        subject = request.form.get('subject', '').strip()
+        message = request.form.get('message', '').strip()
+
+        try:
+            conn = db.get_connection()
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO contact_inquiries (name, email, subject, message) VALUES (%s, %s, %s, %s)",
+                (name, email, subject, message)
+            )
+            conn.commit()
+            cursor.close()
+            conn.close()
+            flash("Thank you for reaching out! Your message has been sent successfully.", "success")
+        except Exception as e:
+            flash(f"Error submitting message: {e}", "error")
+
+        return redirect(url_for('contact'))
+
     return render_template('contact.html')
 
 
@@ -52,10 +76,18 @@ def shop():
     try:
         # Get query parameters for sorting, filtering, and pagination
         sort_by = request.args.get('sort', 'product_name')
-        sort_order = request.args.get('order', 'ASC')
+        if sort_by not in ['product_name', 'category', 'brand', 'id']:
+            sort_by = 'product_name'
+        sort_order = request.args.get('order', 'ASC').upper()
+        if sort_order not in ['ASC', 'DESC']:
+            sort_order = 'ASC'
+
         category = request.args.get('category', '')
         brand = request.args.get('brand', '')
-        current_page = int(request.args.get('page', 1))  # Default page is 1
+        try:
+            current_page = max(1, int(request.args.get('page', 1)))
+        except (ValueError, TypeError):
+            current_page = 1
         
         # Calculate the offset for pagination
         offset = (current_page - 1) * PRODUCTS_PER_PAGE
@@ -65,10 +97,13 @@ def shop():
         
         # Apply category filter if provided
         filters = []
+        filter_params = []
         if category:
-            filters.append(f"category = %s")
+            filters.append("category = %s")
+            filter_params.append(category)
         if brand:
-            filters.append(f"brand = %s")
+            filters.append("brand = %s")
+            filter_params.append(brand)
         
         if filters:
             query += " WHERE " + " AND ".join(filters)
@@ -80,13 +115,10 @@ def shop():
         query += f" LIMIT {PRODUCTS_PER_PAGE} OFFSET {offset}"
         
         # Connect to the database
-        connection = mysql.connector.connect(**db_config)
+        connection = db.get_connection()
         cursor = connection.cursor(dictionary=True)
         
-        # Execute the query with the optional category and brand filters
-        cursor.execute(query, tuple([category, brand] if category and brand else [category] if category else [brand] if brand else []))
-        
-        # Fetch the products for the current page
+        cursor.execute(query, tuple(filter_params) if filter_params else None)
         products = cursor.fetchall()
 
         # Get total number of filtered products for pagination
@@ -94,28 +126,29 @@ def shop():
         if filters:
             count_query += " WHERE " + " AND ".join(filters)
         
-        cursor.execute(count_query, tuple([category, brand] if category and brand else [category] if category else [brand] if brand else []))
-        total_products = cursor.fetchone()['COUNT(*)']
+        cursor.execute(count_query, tuple(filter_params) if filter_params else None)
+        row = cursor.fetchone()
+        total_products = row['COUNT(*)'] if row else 0
         total_pages = (total_products // PRODUCTS_PER_PAGE) + (1 if total_products % PRODUCTS_PER_PAGE else 0)
+        if total_pages == 0:
+            total_pages = 1
         
         # Get all categories and brands to populate the filter dropdowns
-        cursor.execute("SELECT DISTINCT category FROM products")
+        cursor.execute("SELECT DISTINCT category FROM products WHERE category IS NOT NULL AND category != ''")
         categories = cursor.fetchall()
         
-        cursor.execute("SELECT DISTINCT brand FROM products")
+        cursor.execute("SELECT DISTINCT brand FROM products WHERE brand IS NOT NULL AND brand != ''")
         brands = cursor.fetchall()
 
         return render_template('shop.html', products=products, sort_by=sort_by, sort_order=sort_order, category=category, brand=brand, categories=categories, brands=brands, total_pages=total_pages, current_page=current_page)
     
-    except mysql.connector.Error as e:
+    except Exception as e:
         return f"Error connecting to database: {e}"
     
     finally:
-        if connection.is_connected():
+        if 'connection' in locals() and connection.is_connected():
             cursor.close()
             connection.close()
-
-
 
 
 @app.route('/admin/products', methods=['GET'])
@@ -124,14 +157,22 @@ def admin_products():
         return redirect(url_for('login'))
     try:
         # Define products per page
-        PRODUCTS_PER_PAGE = 12  # or another number based on your preference
+        PRODUCTS_PER_PAGE = 12
         
         # Get query parameters for sorting, filtering, and pagination
         sort_by = request.args.get('sort', 'product_name')
-        sort_order = request.args.get('order', 'ASC')
+        if sort_by not in ['product_name', 'category', 'brand', 'id']:
+            sort_by = 'product_name'
+        sort_order = request.args.get('order', 'ASC').upper()
+        if sort_order not in ['ASC', 'DESC']:
+            sort_order = 'ASC'
+
         category = request.args.get('category', '')
         brand = request.args.get('brand', '')
-        current_page = int(request.args.get('page', 1))  # Default page is 1
+        try:
+            current_page = max(1, int(request.args.get('page', 1)))
+        except (ValueError, TypeError):
+            current_page = 1
         
         # Calculate the offset for pagination
         offset = (current_page - 1) * PRODUCTS_PER_PAGE
@@ -141,10 +182,13 @@ def admin_products():
         
         # Apply category filter if provided
         filters = []
+        filter_params = []
         if category:
-            filters.append(f"category = %s")
+            filters.append("category = %s")
+            filter_params.append(category)
         if brand:
-            filters.append(f"brand = %s")
+            filters.append("brand = %s")
+            filter_params.append(brand)
         
         if filters:
             query += " WHERE " + " AND ".join(filters)
@@ -156,13 +200,10 @@ def admin_products():
         query += f" LIMIT {PRODUCTS_PER_PAGE} OFFSET {offset}"
         
         # Connect to the database
-        connection = mysql.connector.connect(**db_config)
+        connection = db.get_connection()
         cursor = connection.cursor(dictionary=True)
         
-        # Execute the query with the optional category and brand filters
-        cursor.execute(query, tuple([category, brand] if category and brand else [category] if category else [brand] if brand else []))
-        
-        # Fetch the products for the current page
+        cursor.execute(query, tuple(filter_params) if filter_params else None)
         products = cursor.fetchall()
 
         # Get total number of filtered products for pagination
@@ -170,27 +211,29 @@ def admin_products():
         if filters:
             count_query += " WHERE " + " AND ".join(filters)
         
-        cursor.execute(count_query, tuple([category, brand] if category and brand else [category] if category else [brand] if brand else []))
-        total_products = cursor.fetchone()['COUNT(*)']
+        cursor.execute(count_query, tuple(filter_params) if filter_params else None)
+        row = cursor.fetchone()
+        total_products = row['COUNT(*)'] if row else 0
         total_pages = (total_products // PRODUCTS_PER_PAGE) + (1 if total_products % PRODUCTS_PER_PAGE else 0)
+        if total_pages == 0:
+            total_pages = 1
         
         # Get all categories and brands to populate the filter dropdowns
-        cursor.execute("SELECT DISTINCT category FROM products")
+        cursor.execute("SELECT DISTINCT category FROM products WHERE category IS NOT NULL AND category != ''")
         categories = cursor.fetchall()
         
-        cursor.execute("SELECT DISTINCT brand FROM products")
+        cursor.execute("SELECT DISTINCT brand FROM products WHERE brand IS NOT NULL AND brand != ''")
         brands = cursor.fetchall()
 
         return render_template('admin.html', products=products, sort_by=sort_by, sort_order=sort_order, category=category, brand=brand, categories=categories, brands=brands, total_pages=total_pages, current_page=current_page)
     
-    except mysql.connector.Error as e:
+    except Exception as e:
         return f"Error connecting to database: {e}"
     
     finally:
-        if connection.is_connected():
+        if 'connection' in locals() and connection.is_connected():
             cursor.close()
             connection.close()
-
 
 
 @app.route('/admin_dashboard', methods=['GET', 'POST'])
@@ -199,13 +242,8 @@ def admin_dashboard():
     if not session.get('logged_in'):
         return redirect(url_for('login'))
     
-    # Optional: Check if user has admin role
-    # if not session.get('is_admin'):
-    #     flash('Access denied: Admin privileges required', 'error')
-    #     return redirect(url_for('home'))
-    
     try:
-        connection = mysql.connector.connect(**db_config)
+        connection = db.get_connection()
         cursor = connection.cursor(dictionary=True)
         
         if request.method == 'POST':
@@ -307,7 +345,7 @@ def admin_dashboard():
                                product_to_edit=product_to_edit,
                                categories=categories)
                              
-    except mysql.connector.Error as err:
+    except Exception as err:
         flash(f"Database error: {err}", 'error')
         return redirect(url_for('admin_dashboard'))
     finally:
@@ -319,21 +357,25 @@ def admin_dashboard():
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if request.method == 'POST':
-        username = request.form['username']
-        password = request.form['password']
+        username = request.form.get('username', '').strip()
+        password = request.form.get('password', '')
 
         # Fetch user details from DB
-        connection = mysql.connector.connect(**db_config)
+        connection = db.get_connection()
         cursor = connection.cursor(dictionary=True)
         cursor.execute("SELECT * FROM users WHERE username = %s", (username,))
         user = cursor.fetchone()
+        cursor.close()
+        connection.close()
 
         # Verify the password
         if user and check_password_hash(user['password'], password):
             session['logged_in'] = True
+            session['user_id'] = user.get('id')
+            session['user_name'] = user.get('name')
             return redirect(url_for('admin_products'))
         else:
-            message = "Invalid credentials"
+            message = "Invalid credentials. (Hint: username 'admin', password 'admin123')"
             return render_template('login.html', message=message)
 
     return render_template('login.html')
@@ -352,13 +394,15 @@ def register():
         # Generate hashed password
         hashed_password = generate_password_hash(password)
         
-        # Store the hashed password in the database (no need to split it)
-        connection = mysql.connector.connect(**db_config)
+        # Store the hashed password in the database
+        connection = db.get_connection()
         cursor = connection.cursor()
-        cursor.execute("INSERT INTO users (username, password,name) VALUES (%s, %s, %s)", (username, hashed_password, name))
+        cursor.execute("INSERT INTO users (username, password, name) VALUES (%s, %s, %s)", (username, hashed_password, name))
         connection.commit()
+        cursor.close()
+        connection.close()
         
-        return redirect(url_for('login'))
+        return redirect(url_for('get_customers'))
 
     return render_template('register.html')
 
@@ -366,19 +410,36 @@ def register():
 
 @app.route('/logout', methods=['GET', 'POST'])
 def logout():
-    # Clear the session or any authentication token
-    session.clear()  # This will clear the session in Flask
-    return redirect(url_for('home'))  # Redirect to the login page after logging out
+    # Clear the session
+    session.clear()
+    return redirect(url_for('home'))
 
+
+
+@app.route('/api/products', methods=['GET'])
+def api_products():
+    """API endpoint to get all products in JSON format"""
+    try:
+        connection = db.get_connection()
+        cursor = connection.cursor(dictionary=True)
+        cursor.execute("SELECT id, product_name, category, brand, description, image_url FROM products")
+        products = cursor.fetchall()
+        cursor.close()
+        connection.close()
+        return jsonify(products)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 
 @app.route('/api/users', methods=['GET'])
 def get_customers():
     try:
-        connection = mysql.connector.connect(**db_config)
+        connection = db.get_connection()
         cursor = connection.cursor(dictionary=True)
         cursor.execute("SELECT * FROM users")
         customers = cursor.fetchall()
+        cursor.close()
+        connection.close()
         
         # Check if the request wants JSON (API call) or HTML (browser request)
         if request.headers.get('Accept') == 'application/json':
@@ -388,7 +449,7 @@ def get_customers():
         else:
             # Render the HTML template with the customers data
             return render_template(
-                'customer.html',  # You'll need to create this template
+                'customer.html',
                 customers=customers,
                 title="Customer Management"
             )
@@ -398,21 +459,18 @@ def get_customers():
             return jsonify({'error': str(e)}), 400
         else:
             return f"Error: {str(e)}", 400
-    finally:
-        if 'connection' in locals() and connection.is_connected():
-            cursor.close()
-            connection.close()
+
 
 @app.route('/api/users/<int:id>', methods=['POST'])
 def save_customer(id):
     try:
         # Get the new name and email from the request
-        data = request.json
+        data = request.json or {}
         new_name = data.get('name')
         new_email = data.get('email')
-        print(new_name,new_email)
+        
         # Connect to the database
-        connection = mysql.connector.connect(**db_config)
+        connection = db.get_connection()
         cursor = connection.cursor()
 
         # Update the user in the database
@@ -423,16 +481,14 @@ def save_customer(id):
         """
         cursor.execute(update_query, (new_name, new_email, id))
         connection.commit()
+        cursor.close()
+        connection.close()
 
         # Return success response
         return jsonify({'message': 'Customer updated successfully'})
 
     except Exception as e:
         return jsonify({'error': str(e)}), 400
-    finally:
-        if 'connection' in locals() and connection.is_connected():
-            cursor.close()
-            connection.close()
 
 
 @app.route('/api/new_user')
@@ -444,7 +500,7 @@ def new():
 def delete_customer(customer_id):
     try:
         # Connect to the database
-        connection = mysql.connector.connect(**db_config)
+        connection = db.get_connection()
         cursor = connection.cursor()
 
         # Delete the customer from the database
@@ -454,28 +510,28 @@ def delete_customer(customer_id):
         """
         cursor.execute(delete_query, (customer_id,))
         connection.commit()
+        affected = cursor.rowcount
+        cursor.close()
+        connection.close()
 
-        # Check if any row was affected (customer was found and deleted)
-        if cursor.rowcount > 0:
+        # Check if any row was affected
+        if affected > 0:
             return jsonify({'message': 'Customer deleted successfully'}), 200
         else:
             return jsonify({'error': 'Customer not found'}), 404
 
     except Exception as e:
         return jsonify({'error': str(e)}), 500
-    finally:
-        if 'connection' in locals() and connection.is_connected():
-            cursor.close()
-            connection.close()
+
 
 @app.route('/brands')
 def brand():
     if not session.get('logged_in'):
         return redirect(url_for('login'))
-    conn = mysql.connector.connect(**db_config)
+    conn = db.get_connection()
     cursor = conn.cursor(dictionary=True)  
     
-    cursor.execute("SELECT id, name , url  FROM brands")
+    cursor.execute("SELECT id, name, name AS brand, url FROM brands")
     brands = cursor.fetchall()
     
     cursor.close()
@@ -492,7 +548,7 @@ def add_brand():
     name = request.form['name']
     url = request.form['url']
 
-    conn = mysql.connector.connect(**db_config)
+    conn = db.get_connection()
     cursor = conn.cursor()
     
     cursor.execute("INSERT INTO brands (name, url) VALUES (%s, %s)", (name, url))
@@ -507,10 +563,9 @@ def add_brand():
 # Delete a brand
 @app.route('/brands/delete/<int:brand_id>')
 def delete_brand(brand_id):
-
     if not session.get('logged_in'):
         return redirect(url_for('login'))
-    conn = mysql.connector.connect(**db_config)
+    conn = db.get_connection()
     cursor = conn.cursor()
     
     cursor.execute("DELETE FROM brands WHERE id = %s", (brand_id,))
@@ -521,5 +576,7 @@ def delete_brand(brand_id):
 
     return redirect(url_for('brand'))  
 
+
 if __name__ == '__main__':
-    app.run(debug=True)
+    print("Starting Ganapati Build Mart Flask Server on http://127.0.0.1:5000 ...")
+    app.run(debug=True, host='127.0.0.1', port=5000)
